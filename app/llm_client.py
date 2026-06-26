@@ -14,10 +14,14 @@ Features:
 
 Environment variables (all optional):
   LLM_API_KEY      - bearer token (or "dummy" to disable calls)
-  LLM_BASE_URL     - e.g. https://api.openai.com/v1
-  LLM_MODEL        - e.g. gpt-4o-mini
+  LLM_BASE_URL     - e.g. https://api.openai.com/v1 or https://openrouter.ai/api/v1
+  LLM_MODEL        - e.g. gpt-4o-mini or openai/gpt-4o-mini (OpenRouter slug)
   LLM_TIMEOUT_S    - per-call timeout in seconds (default 8)
   LLM_ENABLED      - "0" to force-disable regardless of other env vars
+
+OpenRouter extras (optional, for attribution/ranking):
+  OPENROUTER_APP_NAME  - sent as X-Title header
+  OPENROUTER_APP_URL   - sent as HTTP-Referer header
 """
 
 from __future__ import annotations
@@ -86,6 +90,8 @@ def _load_config() -> LLMConfig:
     enabled_env = os.environ.get("LLM_ENABLED", "1").lower() not in {"0", "false", "no"}
     api_key = os.environ.get("LLM_API_KEY") or None
     base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    # OpenRouter requires "provider/model" slugs (e.g. "openai/gpt-4o-mini").
+    # We default to the OpenAI-compatible path but accept whatever the user sets.
     model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
     timeout_s = float(os.environ.get("LLM_TIMEOUT_S", "8"))
     enabled = enabled_env and bool(api_key) and api_key.lower() != "dummy"
@@ -96,6 +102,18 @@ def _load_config() -> LLMConfig:
         timeout_s=timeout_s,
         enabled=enabled,
     )
+
+
+def _provider_headers() -> Dict[str, str]:
+    """Extra headers for OpenRouter attribution. Harmless on other providers."""
+    h: Dict[str, str] = {}
+    name = os.environ.get("OPENROUTER_APP_NAME")
+    url = os.environ.get("OPENROUTER_APP_URL")
+    if name:
+        h["X-Title"] = name
+    if url:
+        h["HTTP-Referer"] = url
+    return h
 
 
 class LLMClient:
@@ -177,13 +195,16 @@ class LLMClient:
             "temperature": 0.0,
             "max_tokens": 700,
         }
+        headers: Dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.api_key}",
+        }
+        # OpenRouter-friendly attribution headers; ignored by other providers.
+        headers.update(_provider_headers())
         req = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.config.api_key}",
-            },
+            headers=headers,
             method="POST",
         )
         t0 = time.time()

@@ -588,6 +588,15 @@ def _derive_evidence_verdict(s: Signals) -> str:
         ):
             return "insufficient_data"
 
+    # If 3+ transactions all tie at the top score (no phone to disambiguate),
+    # the case is genuinely ambiguous — return insufficient_data even when an
+    # amount was mentioned. SAMPLE-08: three same-amount transfers to two
+    # recipients with no phone in the complaint.
+    if len(s.txn_scores) >= 3 and not s.phones:
+        tied = sum(1 for ts in s.txn_scores if ts.score >= s.top_txn_score - 0.01)
+        if tied >= 3 and s.top_txn_score >= 1.0:
+            return "insufficient_data"
+
     # If the top scorer has a very small lead over the second, treat as inconsistent.
     if len(s.txn_scores) >= 2:
         second = s.txn_scores[1].score
@@ -613,23 +622,36 @@ def _resolve_duplicate_pair(
     complaint says "wrong person"): pick the most recent one because that is
     what the customer is currently worried about.
     """
-    # SAMPLE-02: repeated transfers to the same counterparty, complaint says
-    # "wrong person / wrong number". Pick the MOST RECENT one (the customer's
-    # current concern) so dispute_resolution has a concrete tx to investigate.
+    # SAMPLE-02: repeated transfers to the same counterparty, complaint EXPLICITLY
+    # says "wrong person / wrong number / wrong recipient" (not just any wrong-
+    # transfer hint like "to my brother but he didn't get it", which is a
+    # delivery question — SAMPLE-08). Pick the MOST RECENT one as the
+    # customer's current concern so dispute_resolution has a concrete tx.
     if s.has_keyword_wrong_transfer and history:
-        recipients: Dict[str, List[TransactionHistoryEntry]] = {}
-        for txn in history:
-            recipients.setdefault(txn.counterparty, []).append(txn)
-        # Find the recipient with the most txns AND a recent one.
-        best: Optional[TransactionHistoryEntry] = None
-        for cp, txns in recipients.items():
-            if len(txns) < 2:
-                continue
-            txns_sorted = sorted(txns, key=lambda t: t.timestamp, reverse=True)
-            if best is None or txns_sorted[0].timestamp > best.timestamp:
-                best = txns_sorted[0]
-        if best is not None:
-            return best
+        lc = s.complaint.lower() if s.complaint else ""
+        explicit_wrong_recipient = any(
+            p in lc
+            for p in (
+                "wrong number", "wrong person", "wrong account",
+                "wrong recipient", "sent to wrong", "transferred to wrong",
+                "sent by mistake", "mistakenly sent",
+                "sent to the wrong",
+            )
+        )
+        if explicit_wrong_recipient:
+            recipients: Dict[str, List[TransactionHistoryEntry]] = {}
+            for txn in history:
+                recipients.setdefault(txn.counterparty, []).append(txn)
+            # Find the recipient with the most txns AND a recent one.
+            best: Optional[TransactionHistoryEntry] = None
+            for cp, txns in recipients.items():
+                if len(txns) < 2:
+                    continue
+                txns_sorted = sorted(txns, key=lambda t: t.timestamp, reverse=True)
+                if best is None or txns_sorted[0].timestamp > best.timestamp:
+                    best = txns_sorted[0]
+            if best is not None:
+                return best
 
     if len(history) < 2:
         return s.top_txn

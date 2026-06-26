@@ -15,8 +15,10 @@ HTTP semantics (Problem Statement section 4.1):
 from __future__ import annotations
 
 import logging
+import os
 import time
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -24,6 +26,11 @@ from fastapi.responses import JSONResponse
 from app.llm_client import LLMClient
 from app.reasoning import decide
 from app.schemas import AnalyzeTicketRequest, AnalyzeTicketResponse
+
+# Load .env from the project root (if present) BEFORE reading env vars for
+# the LLM client. Existing real env vars take precedence over .env values.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_PROJECT_ROOT, ".env"), override=False)
 
 logging.basicConfig(
     level=logging.INFO,
