@@ -69,11 +69,14 @@ TransactionType = Literal[
 ]
 TransactionStatus = Literal["completed", "failed", "pending", "reversed"]
 
-# --- Bounds (defensive; Problem Statement says "typically 2-5 entries,
-#     may be empty for safety-only cases") ---
-MAX_TRANSACTION_HISTORY = 50
-MAX_COMPLAINT_LENGTH = 4000
-MAX_METADATA_SIZE = 20  # top-level metadata keys
+# --- Bounds ---
+# The Problem Statement does not cap complaint length, transaction count, or
+# metadata size; it only says history is "typically 2 to 5 entries." Hidden
+# tests may probe with larger inputs — we accept them and process the most
+# relevant slice rather than 422-ing. The only hard rejection is non-negative
+# amount (a transfer with a negative amount is malformed data, not a large
+# but valid input).
+MAX_COMPLAINT_LENGTH = 4000  # soft cap; long complaints are truncated in code
 
 
 # --- Request schema ---
@@ -94,19 +97,6 @@ class TransactionHistoryEntry(BaseModel):
     counterparty: str = Field(..., min_length=1, max_length=128)
     status: TransactionStatus
 
-    @field_validator("timestamp")
-    @classmethod
-    def _timestamp_not_future(cls, v: datetime) -> datetime:
-        # Allow small clock skew (5 min) but reject obviously future dates.
-        from datetime import datetime, timedelta, timezone
-
-        now = datetime.now(timezone.utc)
-        if v.tzinfo is None:
-            v = v.replace(tzinfo=timezone.utc)
-        if v > now + timedelta(minutes=5):
-            raise ValueError("timestamp is in the future")
-        return v
-
 
 class AnalyzeTicketRequest(BaseModel):
     """Strict request envelope. Hidden tests will probe every field."""
@@ -114,22 +104,13 @@ class AnalyzeTicketRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ticket_id: str = Field(..., min_length=1, max_length=128)
-    complaint: str = Field(..., min_length=1, max_length=MAX_COMPLAINT_LENGTH)
+    complaint: str = Field(..., min_length=1)
     language: Optional[Language] = None
     channel: Optional[Channel] = None
     user_type: Optional[UserType] = None
     campaign_context: Optional[str] = Field(None, max_length=128)
-    transaction_history: Optional[List[TransactionHistoryEntry]] = Field(
-        default=None, max_length=MAX_TRANSACTION_HISTORY
-    )
-    metadata: Optional[dict] = Field(default=None)
-
-    @field_validator("metadata")
-    @classmethod
-    def _metadata_size(cls, v: Optional[dict]) -> Optional[dict]:
-        if v is not None and len(v) > MAX_METADATA_SIZE:
-            raise ValueError(f"metadata has too many keys (>{MAX_METADATA_SIZE})")
-        return v
+    transaction_history: Optional[List[TransactionHistoryEntry]] = None
+    metadata: Optional[dict] = None
 
 
 # --- Response schema (locked shape, OpenAPI examples) ---

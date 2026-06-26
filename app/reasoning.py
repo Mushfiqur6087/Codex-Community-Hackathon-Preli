@@ -64,6 +64,32 @@ def _bn_digits_to_en(text: str) -> str:
     return "".join(_BN_DIGIT_MAP.get(ch, ch) for ch in text)
 
 
+def _is_bangla_text(text: str) -> bool:
+    """True if the text contains enough Bengali Unicode characters to call it Bangla.
+
+    Used to pick the reply language when `language` is missing or "mixed".
+    Bengali Unicode block: U+0980 .. U+09FF.
+    """
+    if not text:
+        return False
+    bn = sum(1 for ch in text if "ঀ" <= ch <= "৿")
+    return bn >= 2
+
+
+def _pick_bangla(req: "AnalyzeTicketRequest") -> bool:
+    """Decide whether to emit Bangla reply text.
+
+    Explicit `language="bn"` wins. Otherwise sniff the complaint itself so
+    `language="mixed"` or missing-language Bangla complaints still get a
+    Bangla reply (tie-breaker #6 in the rubric).
+    """
+    if req.language == "bn":
+        return True
+    if req.language == "en":
+        return False
+    return _is_bangla_text(req.complaint)
+
+
 # Reusable template chunks. We compose, never interpolate user text directly
 # into the customer_reply (Step 4 hardening will block any credential mention).
 
@@ -131,7 +157,7 @@ def _rule_path_decide(
     txn_id = sig.top_txn.transaction_id if sig.top_txn else None
     amount = sig.top_txn.amount if sig.top_txn else None
     overrides: List[str] = []
-    is_bn = (req.language == "bn")
+    is_bn = _pick_bangla(req)
 
     # CASE: Phishing / social engineering.
     if sig.phishing_request or sig.credential_leak:
@@ -510,14 +536,61 @@ _UNSAFE_PHRASES_IN_REPLY = (
 
 
 def _scrub_unsafe(text: str) -> str:
-    """Replace any unsafe phrase with a safe alternative. Defensive."""
+    """Replace any unsafe phrase with a safe alternative. Defensive.
+
+    Covers English and Bangla. Bangla patterns are essential because the
+    safety check is automated and Bangla handling is tie-breaker #6.
+    """
     out = text
+    # --- English refund / reversal / unblock promises (-10 each) ---
     out = re.sub(r"(?i)we\s+will\s+refund\s+you", "any eligible amount will be returned through official channels", out)
     out = re.sub(r"(?i)we\s+have\s+refunded", "any eligible amount will be returned through official channels", out)
+    out = re.sub(r"(?i)we\s+already\s+refunded", "any eligible amount will be returned through official channels", out)
+    out = re.sub(r"(?i)we(?:'ll| will)?\s+send\s+(?:you\s+)?(?:your\s+)?money\s+back", "any eligible amount will be returned through official channels", out)
+    out = re.sub(r"(?i)funds?\s+will\s+be\s+returned\s+shortly", "any eligible amount will be returned through official channels", out)
     out = re.sub(r"(?i)we\s+will\s+reverse\s+it", "any eligible reversal will be processed through official channels", out)
+    out = re.sub(r"(?i)we\s+have\s+reversed", "any eligible reversal will be processed through official channels", out)
     out = re.sub(r"(?i)your\s+account\s+is\s+unblocked", "your account access will be reviewed by the appropriate team", out)
-    out = re.sub(r"(?i)call\s+this\s+number", "contact us only through official support channels", out)
-    out = re.sub(r"(?i)contact\s+this\s+number", "contact us only through official support channels", out)
+    out = re.sub(r"(?i)we\s+have\s+unblocked", "your account access will be reviewed by the appropriate team", out)
+    # --- Redirect to official channels (avoid "call this number") ---
+    # Consume any trailing phone-number-looking token (digits/spaces/+).
+    out = re.sub(
+        r"(?i)call\s+this\s+number(?:\s*[:\-]?\s*[\d\s+]+)?",
+        "contact us only through official support channels",
+        out,
+    )
+    out = re.sub(
+        r"(?i)contact\s+this\s+number(?:\s*[:\-]?\s*[\d\s+]+)?",
+        "contact us only through official support channels",
+        out,
+    )
+    # --- Credential requests (-15). Replace with a reminder. ---
+    out = re.sub(r"(?i)(?:please\s+)?share\s+your\s+(?:pin|otp|password|cvv)", "we never ask for your PIN, OTP, or password", out)
+    out = re.sub(r"(?i)(?:please\s+)?send\s+your\s+(?:pin|otp|password|cvv)", "we never ask for your PIN, OTP, or password", out)
+    out = re.sub(r"(?i)(?:please\s+)?enter\s+your\s+(?:pin|otp|password|cvv)", "we never ask for your PIN, OTP, or password", out)
+
+    # --- Bangla refund / reversal / unblock promises ---
+    # Capture the trailing verb too so we don't leave a dangling "দেবো".
+    # Safe replacement: "any eligible amount will be returned through
+    # official channels."
+    _BN_REFUND_SAFE = "যোগ্য পরিমাণ অফিসিয়াল চ্যানেলের মাধ্যমে ফেরত দেওয়া হবে"
+    out = re.sub(r"টাকা\s*ফেরত(?:\s+দেবো?|\s+পাবেন|\s+চাই)?", _BN_REFUND_SAFE, out)
+    out = re.sub(r"ফেরত\s+দেবো?", _BN_REFUND_SAFE, out)
+    out = re.sub(r"ফেরত\s+পাবেন", _BN_REFUND_SAFE, out)
+    out = re.sub(r"রিফান্ড\s*করব(?:েন)?", _BN_REFUND_SAFE, out)
+    out = re.sub(r"ব্যালেন্স\s*ফেরত(?:\s+দেবো?|\s+পাবেন)?", _BN_REFUND_SAFE, out)
+    out = re.sub(r"আনব্লক\s*করব(?:েন)?", "আপনার অ্যাকাউন্ট পর্যালোচনা করা হবে", out)
+    # --- Bangla credential requests ---
+    out = re.sub(
+        r"আপনার\s*(?:ওটিপি|পিন|পাসওয়ার্ড)(?:\s+(?:দিন|দাও|শেয়ার\s*করুন|প্রদান\s*করুন))?",
+        "আমরা কখনোই পিন, ওটিপি বা পাসওয়ার্ড চাই না",
+        out,
+    )
+    out = re.sub(
+        r"(?:ওটিপি|পিন|পাসওয়ার্ড)\s*(?:দিন|দাও|শেয়ার\s*করুন|প্রদান\s*করুন)",
+        "আমরা কখনোই পিন, ওটিপি বা পাসওয়ার্ড চাই না",
+        out,
+    )
     return out
 
 
@@ -582,13 +655,21 @@ def _verifier(
             draft["severity"] = "critical" if sig.credential_leak else "high"
 
     # --- O5: scrub customer_reply ---
-    is_bn = (req.language == "bn")
+    is_bn = _pick_bangla(req)
     reply = str(draft.get("customer_reply", "") or "")
     scrubbed = _scrub_unsafe(reply)
     scrubbed = _ensure_safety_reminder(scrubbed, is_bn)
     if scrubbed != reply:
         overrides.append("reply_safety_scrub")
     draft["customer_reply"] = scrubbed[:2000]
+
+    # Spec §8: refund/reversal/unblock promises are checked on
+    # customer_reply AND recommended_next_action. Scrub both.
+    action = str(draft.get("recommended_next_action", "") or "")
+    scrubbed_action = _scrub_unsafe(action)
+    if scrubbed_action != action:
+        overrides.append("action_safety_scrub")
+    draft["recommended_next_action"] = scrubbed_action[:2000]
 
     # Also scrub agent_summary if it accidentally contains an unsafe phrase.
     summary = str(draft.get("agent_summary", "") or "")
@@ -623,6 +704,19 @@ def _verifier(
 
     # Ensure human_review_required is boolean.
     draft["human_review_required"] = bool(draft.get("human_review_required", False))
+
+    # O8: For genuinely vague complaints (no money movement intent + insufficient
+    # data), the spec sample shows human_review_required=False. Force this so
+    # the LLM can't escalate a nothing-burger complaint that has no transaction
+    # to review. Disputes/suspicious cases have has_money_movement_intent=True
+    # and are unaffected.
+    if (
+        draft.get("human_review_required") is True
+        and sig.evidence_verdict == "insufficient_data"
+        and not sig.has_money_movement_intent
+    ):
+        overrides.append("human_review_forced_false_vague")
+        draft["human_review_required"] = False
 
     return draft, overrides
 

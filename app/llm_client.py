@@ -112,14 +112,18 @@ class LLMClient:
         self,
         system_prompt: str,
         user_prompt: str,
-        max_retries: int = 1,
+        max_retries: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """Return parsed JSON dict or None on failure.
 
         Strategy:
           1. Call once.
-          2. If response is not valid JSON, send a strict repair prompt once
-             more (max_retries=1 by default). If still invalid -> None.
+          2. If response is not valid JSON and max_retries > 0, send a strict
+             repair prompt and try again. If still invalid -> None.
+
+        Default is single-shot (max_retries=0) so worst-case latency stays
+        at one timeout (default 5s) — partial-credit tier in the rubric —
+        rather than two. The rule path catches any LLM miss safely.
         """
         if not self.enabled:
             return None

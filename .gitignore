@@ -12,3 +12,7 @@ venv/
 dist/
 build/
 *.egg-info/
+
+# Local-only synthetic edge cases (not part of the judge contract).
+scripts/synthetic_edge_cases.json
+scripts/synthetic_results.json

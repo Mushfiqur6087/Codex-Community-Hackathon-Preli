@@ -43,21 +43,54 @@ _PHONE = re.compile(
 # Counterparty in transaction history: "+880..." or "AGENT-..." or "MERCHANT-..."
 # is stored as-is; we use string-equality match in scoring.
 
-# Phishing / credential markers. These are HARD triggers (override path).
-_PHISHING_PHRASES = (
+# Phishing detection. Two-tier: a credential word alone is NOT enough —
+# require either an explicit hard phrase (e.g. "asked for my OTP") or the
+# co-occurrence of a credential word with a phishing-context phrase. This
+# prevents false positives like "I forgot my password" or "verify your
+# identity at the agent" from being routed to fraud_risk.
+_CREDENTIAL_WORDS = (
     "otp", "one time password", "one-time password",
     "pin", "password", "cvv", "card number",
-    "share my otp", "share my pin", "share the otp", "share the pin",
-    "give my otp", "give my pin",
+)
+
+# Phishing-context phrases. Require a credential word nearby.
+_PHISHING_CONTEXT = (
+    "asked for", "asking for", "share", "shared", "give", "gave",
     "verify your account", "verify your identity",
-    "account will be blocked", "account will be suspended",
     "blocked if", "suspended if",
     "click the link", "click this link",
     "customer care number", "helpline number", "call this number",
-    "agent asked me to share", "asked for my otp", "asked for my pin",
-    "they said they are from", "claiming to be from",
-    "fake message", "fraud call", "scam call",
+    "claiming to be from", "they said they are from", "said they are from",
+    "agent asked me", "fake call", "fraud call", "scam call",
+    "fake message", "scam message",
+)
+
+# Hard phishing triggers. Sufficient on their own.
+_PHISHING_HARD = (
+    "asked for my otp", "asked for my pin", "asked for my password",
+    "share my otp", "share my pin", "share the otp", "share the pin",
+    "give my otp", "give my pin", "give your otp", "give your pin",
+    "account will be blocked", "account will be suspended",
     "i shared my otp", "i shared my pin", "i gave my otp", "i gave my pin",
+    "claiming to be from bkash", "said they are from bkash",
+    # Bangla hard triggers
+    "ওটিপি চাইল", "পিন চাইল", "পাসওয়ার্ড চাইল",
+    "অ্যাকাউন্ট ব্লক করবে", "অ্যাকাউন্ট বন্ধ করবে",
+    "স্ক্যাম কল", "ফ্রড কল", "ফেক কল", "ফেক মেসেজ",
+)
+
+# Bangla credential-leak regex. Fires when the customer says they already
+# shared a credential. Allow any chars (incl. Bangla letters) in between.
+_BN_LEAK_RE = re.compile(
+    r"(?:ওটিপি|পিন|পাসওয়ার্ড|সিভিভি|cvv).{0,30}?(?:দিয়ে দিয়েছি|দিয়েছি|বলে দিয়েছি|জানিয়ে দিয়েছি)",
+    re.DOTALL,
+)
+
+# English negation patterns — when these precede a sharing verb, the customer
+# is reassuring us they did NOT leak credentials. Should NOT trigger phishing.
+_NEGATED_SHARING_RE = re.compile(
+    r"\b(?:haven't|have\s+not|hadn't|had\s+not|did\s+not|didn't|don't|do\s+not|never|no\s+longer)\b"
+    r"[^.\n]{0,30}\b(?:shared|share|gave|give|sent|send|provided|provide)\b"
 )
 
 # Money-movement / case type cues (looser, used for ranking).
@@ -73,6 +106,9 @@ _KEYWORDS_WRONG_TRANSFER = (
     "to my cousin", "to my colleague",
     "didn't get it", "did not get it", "didn't receive it",
     "did not receive it", "he didn't get", "she didn't get",
+    # Bangla / Banglish cues
+    "ভুল নাম্বার", "ভুল নম্বর", "ভুল করে", "ভুল মানুষ",
+    "পাঠাইসোনি", "পাঠিয়েছিলাম", "টাকা পাঠাইসোনি",
 )
 _KEYWORDS_FAILED_PAYMENT = (
     "payment failed", "pay failed", "transaction failed",
@@ -80,20 +116,29 @@ _KEYWORDS_FAILED_PAYMENT = (
     "but failed", "but the app showed failed", "showed failed",
     "recharge failed", "recharge didn't", "bill payment failed",
     "didn't receive", "not received",
+    # Bangla / Banglish cues
+    "কেটে গেছে", "কেটে গেল", "ব্যালেন্স থেকে কেটে গেছে",
+    "ফেইল করেছে", "ফেল করেছে", "টাকা কাটছে",
 )
 _KEYWORDS_REFUND = (
     "refund", "money back", "return my money", "give me back",
     "i want my money", "please refund", "want a refund",
     "change my mind", "don't want it anymore",
+    # Bangla / Banglish cues
+    "টাকা ফেরত", "ফেরত দিন", "ফেরত চাই", "রিফান্ড",
 )
 _KEYWORDS_DUPLICATE = (
     "twice", "two times", "deducted twice", "charged twice", "paid twice",
     "double charged", "duplicate", "duplicate payment", "twice from my",
+    # Bangla / Banglish cues
+    "দুবার", "দুইবার", "দুই বার", "দুবার কেটেছে",
 )
 _KEYWORDS_SETTLEMENT = (
     "settlement", "settled", "not settled", "haven't been settled",
     "sales", "yesterday's sales", "merchant", "payout", "settle to my account",
     "11am next day", "next day", "by 11am",
+    # Bangla / Banglish cues
+    "সেটেলমেন্ট", "সেটলমেন্ট", "পাওয়া যায়নি", "পাওয়া যায়নি এখনো",
 )
 _KEYWORDS_CASH_IN = (
     "cash in", "cash-in", "cashin", "এজেন্টের কাছে", "ক্যাশ ইন",
@@ -311,6 +356,25 @@ def extract_time_hints(text: str) -> List[TimeHint]:
     return out
 
 
+def _has_failed_payment_signal(lc: str, amounts: List["AmountSignal"]) -> bool:
+    """Detect a failed-payment cue even when the complaint word order varies.
+
+    Catches both "payment failed" (direct phrase) and "failed 700 taka
+    payment" (proximity: failed + money-context word within ~30 chars).
+    """
+    if any(k in lc for k in _KEYWORDS_FAILED_PAYMENT):
+        return True
+    if "failed" not in lc:
+        return False
+    # Proximity: "failed" near a money word OR near any mentioned amount.
+    money_ctx = (
+        "payment" in lc or "recharge" in lc or "transaction" in lc
+        or "transfer" in lc or "bill" in lc or "send" in lc
+        or bool(amounts)
+    )
+    return money_ctx
+
+
 def detect_phishing(text: str) -> Tuple[bool, bool]:
     """Return (is_phishing_request, is_credential_leak).
 
@@ -320,14 +384,31 @@ def detect_phishing(text: str) -> Tuple[bool, bool]:
     is_credential_leak: the user says they ALREADY shared credentials (i.e.,
     the situation is no longer preventive — it is an active compromise). We
     still treat as critical but with a different reason_code.
+
+    Two-tier trigger to avoid false positives:
+      - HARD trigger: an explicit phrase like "asked for my OTP" suffices.
+      - Otherwise: a credential word + a phishing-context phrase must co-occur.
+
+    Negation-aware: "I have not shared my OTP" is reassurance, not a leak.
+    Bangla-aware: leak regex covers "ওটিপি দিয়ে দিয়েছি" patterns.
     """
     t = text.lower()
-    is_phishing = any(p in t for p in _PHISHING_PHRASES)
-    is_leak = bool(re.search(
-        r"\b(i|I've|we|we've|i already|i already shared|i already gave|already shared|already gave)\b"
-        r"[^.\n]{0,40}\b(otp|pin|password|cvv|one time password)\b",
-        t,
-    ))
+    has_cred = any(c in t for c in _CREDENTIAL_WORDS)
+    has_context = any(p in t for p in _PHISHING_CONTEXT)
+    has_hard = any(p in t for p in _PHISHING_HARD)
+    negated = bool(_NEGATED_SHARING_RE.search(t))
+    is_phishing = has_hard or (has_cred and has_context and not negated)
+
+    # English leak = subject + non-negated sharing verb + credential word.
+    is_leak = False
+    if not negated:
+        is_leak = bool(re.search(
+            r"\b(?:i|we)\b[^.\n]{0,20}\b(?:shared|gave|sent|provided|entered|typed|told)\b"
+            r"[^.\n]{0,20}\b(?:otp|pin|password|cvv|one time password)\b",
+            t,
+        ))
+    # Bangla leak (script-level check on the original text).
+    is_leak = is_leak or bool(_BN_LEAK_RE.search(text))
     return is_phishing, is_leak
 
 
@@ -476,7 +557,7 @@ def extract_signals(
 
     lc = complaint.lower()
     s.has_keyword_wrong_transfer = any(k in lc for k in _KEYWORDS_WRONG_TRANSFER)
-    s.has_keyword_failed_payment = any(k in lc for k in _KEYWORDS_FAILED_PAYMENT)
+    s.has_keyword_failed_payment = _has_failed_payment_signal(lc, s.amounts)
     s.has_keyword_refund = any(k in lc for k in _KEYWORDS_REFUND)
     s.has_keyword_duplicate = any(k in lc for k in _KEYWORDS_DUPLICATE)
     s.has_keyword_settlement = any(k in lc for k in _KEYWORDS_SETTLEMENT)
@@ -577,6 +658,11 @@ def _derive_evidence_verdict(s: Signals) -> str:
 
     # SAMPLE-08: ambiguous match — multiple plausible transactions of similar
     # score and no disambiguating phone / counterparty / time signal.
+    # The wrong-transfer keyword check was previously an exclusion here, but
+    # that excluded complaints like "sent to my brother" (a recipient
+    # description, not a wrong-recipient claim). The explicit-wrong-recipient
+    # path returns early above, so reaching here with wrong_transfer keywords
+    # means we genuinely can't disambiguate → insufficient_data.
     if len(s.txn_scores) >= 2:
         top_score = s.top_txn_score
         second_score = s.txn_scores[1].score
@@ -584,7 +670,6 @@ def _derive_evidence_verdict(s: Signals) -> str:
             top_score >= 1.0
             and (top_score - second_score) < 0.5
             and not s.phones
-            and not s.has_keyword_wrong_transfer  # already handled above
         ):
             return "insufficient_data"
 
