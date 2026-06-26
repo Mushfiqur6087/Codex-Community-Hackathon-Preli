@@ -44,9 +44,10 @@ into customer-facing fields. Prompt-injection attempts are ignored.
 ## Tech stack
 
 - **Python 3.11**, **FastAPI** 0.115, **Uvicorn** 0.30, **Pydantic v2** 2.9.
-- **python-dotenv** for local `.env` loading (no-op in production).
-- **No GPU, no local model weights.** Optional external LLM via an
-  OpenAI-compatible HTTP endpoint (any provider).
+- **python-dotenv** for local `.env` loading.
+- **No GPU, no local model weights.** Uses an external OpenAI-compatible
+  LLM via HTTP (OpenRouter, OpenAI, Anthropic, etc.). The LLM is
+  **required** — see Configuration below.
 - **No databases, queues, caches, or background workers.** Each request
   is fully independent.
 
@@ -59,9 +60,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# (Optional) configure the LLM. Without this, the rule path handles everything.
+# Required: configure the LLM. The service refuses to start without these.
 cp .env.example .env
-# edit .env to add LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+# Edit .env and set ALL of: LLM_ENABLED=1, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
+# Without any of them, boot fails with LLMConfigError.
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
@@ -77,11 +79,14 @@ chmod +x scripts/smoke_test.sh
 
 ```bash
 docker build -t queuestorm-team .
+# .env must contain all four required LLM vars (see Configuration).
 docker run -p 8000:8000 --env-file .env queuestorm-team
 ```
 
 The image is `python:3.11-slim` + ~4 Python packages; well under the
 500 MB preferred size, binds to `0.0.0.0`, no GPU, no large downloads.
+If the env file is missing any required LLM var, the container exits at
+boot with `LLMConfigError`.
 
 ---
 
@@ -175,11 +180,15 @@ recommendation in §9 of the Team Instructions Manual.
 | Model | Where it runs | Why |
 |-------|---------------|-----|
 | Rule engine + regex extractors (`app/extractors.py`, `app/reasoning.py`) | In-process, no external call | Deterministic, free, fast (<1 ms typical). Owns evidence + safety. |
-| OpenAI-compatible chat-completions model (default `openai/gpt-4o-mini`) | External HTTP via `LLM_BASE_URL` (OpenRouter, OpenAI, Anthropic, etc.) | Only used for the ambiguous-ticket narrative path. Swappable via env vars; the service runs correctly with no LLM configured. |
+| OpenAI-compatible chat-completions model (default `openai/gpt-4o-mini`) | External HTTP via `LLM_BASE_URL` (OpenRouter, OpenAI, Anthropic, etc.) | Used for the ambiguous-ticket narrative path. **Required at boot** — the service refuses to start without it. |
 
-The LLM is **optional**. With `LLM_ENABLED=0` or no key set, every public
-sample still passes (rule path covers them). The LLM only adds quality
-on unusual cases beyond the public set.
+Although the LLM is mandatory at boot, the rule path still handles every
+clear-cut case (wrong-transfer, failed-payment, refund, duplicate,
+settlement, cash-in, phishing, ambiguous-match) in under 1 ms without
+calling the LLM. The LLM is invoked only when the rule path falls through
+to the default bucket — i.e. genuinely unusual tickets beyond the public
+sample distribution. So while cost per request is typically zero LLM
+calls, the LLM **must** be reachable when an ambiguous case arrives.
 
 ### Cost reasoning
 
@@ -244,15 +253,20 @@ SAMPLE-01).
 ## Configuration
 
 All configuration is via environment variables (see `.env.example`).
+The LLM is **mandatory** — if any of the four required vars below is
+missing or `LLM_ENABLED != "1"`, the service raises `LLMConfigError` at
+boot and exits. `/health` would never report ready in that state.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `PORT` | `8000` | Bind port |
-| `LLM_ENABLED` | `1` | `0` to force-disable the LLM path |
-| `LLM_API_KEY` | (none) | Bearer token; empty → LLM disabled |
-| `LLM_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint |
-| `LLM_MODEL` | `gpt-4o-mini` | Model name (provider-prefixed for OpenRouter) |
-| `LLM_TIMEOUT_S` | `5` | Per-call hard timeout (single-shot, no retry) |
+| Variable | Required? | Default | Purpose |
+|----------|-----------|---------|---------|
+| `LLM_ENABLED` | **yes** | — | Must be exactly `"1"` to start |
+| `LLM_API_KEY` | **yes** | — | Bearer token; non-empty, not `"dummy"` |
+| `LLM_BASE_URL` | **yes** | — | OpenAI-compatible endpoint (e.g. `https://openrouter.ai/api/v1`) |
+| `LLM_MODEL` | **yes** | — | Model slug (e.g. `openai/gpt-4o-mini`) |
+| `LLM_TIMEOUT_S` | no | `5` | Per-call hard timeout (single-shot, no retry) |
+| `OPENROUTER_APP_NAME` | no | — | Sent as `X-Title` (attribution, harmless elsewhere) |
+| `OPENROUTER_APP_URL` | no | — | Sent as `HTTP-Referer` (attribution) |
+| `PORT` | no | `8000` | Bind port (informational; uvicorn flag still wins) |
 
 ---
 
@@ -313,9 +327,17 @@ See `ARCHITECTURE.md` for the full pipeline diagram and design notes.
 
 ## Submission
 
-- Live URL: configure via the hosting platform's env vars.
-- Docker fallback: `docker build -t queuestorm-team . && docker run -p 8000:8000 --env-file .env queuestorm-team`.
-- Code-only: clone, `pip install -r requirements.txt`, `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+All three paths **require the four mandatory LLM env vars** to be set
+(`LLM_ENABLED`, `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`). Without
+them the service exits at boot with `LLMConfigError`.
+
+- **Live URL**: deploy to Render/Railway/Fly/Vercel/Poridhi Lab/AWS, set
+  the four LLM env vars in the hosting platform's dashboard, expose
+  port 8000. `/health` returns ready within ~1 s of process start.
+- **Docker fallback**: `docker build -t queuestorm-team . && docker run -p 8000:8000 --env-file .env queuestorm-team` (`.env` must contain all four LLM vars).
+- **Code-only**: clone, `pip install -r requirements.txt`, `cp .env.example .env && # fill in the 4 LLM vars`, `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
 
 Repository contains **no real secrets**. `.env` is gitignored; only
-`.env.example` (variable names + placeholders) is committed.
+`.env.example` (variable names + placeholders) is committed. Real keys
+go in the hosting platform's env vars (for the Live URL path) or in the
+submission form's private field (for Docker/code fallback).
