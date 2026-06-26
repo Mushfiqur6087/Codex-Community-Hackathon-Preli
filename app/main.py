@@ -58,8 +58,13 @@ app = FastAPI(
 
 @app.get("/health")
 def health() -> dict:
-    """Readiness probe. Judge harness calls this before hidden tests."""
-    return {"status": "ok", "llm_enabled": llm_client.enabled}
+    """Readiness probe. Judge harness calls this before hidden tests.
+
+    Spec (problem_statement.txt §4) requires the body to be exactly
+    {"status": "ok"} -- no extra keys, so the harness can compare bodies
+    literally.
+    """
+    return {"status": "ok"}
 
 
 # --- Main endpoint ---
