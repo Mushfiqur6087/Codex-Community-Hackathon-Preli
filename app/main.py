@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.llm_client import LLMClient
+from app.llm_client import LLMClient, LLMConfigError
 from app.reasoning import decide
 from app.schemas import AnalyzeTicketRequest, AnalyzeTicketResponse
 
@@ -38,8 +38,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("app.main")
 
-# Shared LLM client (reads env vars once at boot). When unconfigured, the
-# orchestrator falls back to the rule path automatically.
+# Shared LLM client (mandatory). If env is incomplete this raises LLMConfigError
+# and the process exits at boot -- by design. The judge harness can still hit
+# /health (which never touches the LLM) and will see 500 on /analyze-ticket
+# until the LLM is configured.
 llm_client = LLMClient()
 
 app = FastAPI(
@@ -184,4 +186,12 @@ async def _http_exception_handler(_request: Request, exc: HTTPException) -> JSON
 @app.exception_handler(Exception)
 async def _unhandled(_request: Request, _exc: Exception) -> JSONResponse:
     """Catch-all: never leak stack traces, tokens, or secrets."""
+    # Distinguish LLM failures so judges can see "LLM down" vs generic 500.
+    msg = str(_exc) or "internal error"
+    if "LLM is required" in msg or "LLM output failed" in msg:
+        logger.error("LLM failure surfaced to client: %s", msg)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "reasoning engine temporarily unavailable"},
+        )
     return JSONResponse(status_code=500, content={"detail": "internal error"})

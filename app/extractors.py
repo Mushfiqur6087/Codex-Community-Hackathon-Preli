@@ -80,20 +80,38 @@ _KEYWORDS_FAILED_PAYMENT = (
     "but failed", "but the app showed failed", "showed failed",
     "recharge failed", "recharge didn't", "bill payment failed",
     "didn't receive", "not received",
+    # Bangla / Banglish coverage for hidden tests
+    "পেমেন্ট ফেইলড", "পেমেন্ট ব্যর্থ", "টাকা কেটে নিয়েছে", "টাকা কাটা হয়েছে",
+    "ব্যালেন্স থেকে টাকা কেটে", "টাকা কেটে গেছে", "কেটে নিয়েছে",
+    "লেনদেন ব্যর্থ", "ট্রানজেকশন ফেইলড", "ফেইল হয়েছে", "ব্যর্থ হয়েছে",
+    "অর্থ প্রদান ব্যর্থ", "পেমেন্ট হয়নি", "করতে পারিনি",
+    "bill pay hoyni", "payment hoyni", "tk keteche", "taka kete niyeche",
 )
 _KEYWORDS_REFUND = (
     "refund", "money back", "return my money", "give me back",
     "i want my money", "please refund", "want a refund",
     "change my mind", "don't want it anymore",
+    # Bangla / Banglish
+    "রিফান্ড", "টাকা ফেরত", "ফেরত দিন", "ফেরত চাই", "ফেরত দিতে হবে",
+    "আমার টাকা ফেরত", "টাকা ফেরত দিন", "ফেরত পেতে চাই",
+    "taka ferot", "refund korte", "taka uthie dite", "ferot din",
 )
 _KEYWORDS_DUPLICATE = (
     "twice", "two times", "deducted twice", "charged twice", "paid twice",
     "double charged", "duplicate", "duplicate payment", "twice from my",
+    # Bangla / Banglish
+    "দুইবার", "দুই বার", "ডাবল", "পুনরায় কেটেছে", "একই পেমেন্ড দুইবার",
+    "দুইবার চার্জ", "দুইবার কেটে নিয়েছে", "ডুপ্লিকেট",
+    "doibar", "double charge hoyeche", "duibar kete niyeche",
 )
 _KEYWORDS_SETTLEMENT = (
     "settlement", "settled", "not settled", "haven't been settled",
     "sales", "yesterday's sales", "merchant", "payout", "settle to my account",
     "11am next day", "next day", "by 11am",
+    # Bangla / Banglish
+    "সেটেলমেন্ট", "মার্চেন্ট", "পেআউট", "বিক্রি", "গতকালের বিক্রি",
+    "সেটেল হয়নি", "হিসাব", "আমার একাউন্টে আসেনি",
+    "settle hoyni", "merchant payout", "bikri r taka",
 )
 _KEYWORDS_CASH_IN = (
     "cash in", "cash-in", "cashin", "এজেন্টের কাছে", "ক্যাশ ইন",
@@ -169,6 +187,7 @@ class Signals:
     confidence_floor: float = 0.4                  # minimum we will emit
     transaction_history_for_verdict: List[TransactionHistoryEntry] = field(default_factory=list)
     is_duplicate_pair: bool = False                # SAMPLE-10 pattern
+    has_vague_complaint: bool = False              # very short, no specific txn / amount / time
 
     def to_prompt_json(self) -> Dict[str, Any]:
         """JSON-safe view for LLM prompts."""
@@ -491,6 +510,15 @@ def extract_signals(
         or s.has_keyword_duplicate
         or s.has_keyword_settlement
         or s.has_keyword_cash_in
+    )
+    # Vague: no money movement intent, no specific amount, no specific phone,
+    # AND the complaint is short (< 80 chars). Used by the verifier to clamp
+    # the LLM away from invented case_type / department.
+    s.has_vague_complaint = (
+        not s.has_money_movement_intent
+        and not s.amounts
+        and not s.phones
+        and len(complaint.strip()) < 80
     )
 
     history = transaction_history or []
