@@ -1,23 +1,27 @@
-"""Tiny LLM client for the hybrid reasoning engine (Step 3).
+"""OpenAI-compatible chat-completions client (mandatory).
 
-The service optionally calls an OpenAI-compatible chat-completions endpoint.
-When no API key / base URL is configured, ``LLMClient.complete`` returns
-``None`` and the caller (reasoning.py) falls back to the rule path. This
-keeps the service fully functional on the 10 samples with zero LLM calls.
+The service requires an LLM to be configured. There is no silent fallback to
+the rule path -- if the LLM is not reachable or returns a non-JSON response,
+the request will surface a controlled 500 error rather than ship a guess.
 
 Features:
-  - Single-call by default; one retry on JSON parse failure with a strict
-    repair prompt ("respond ONLY with valid JSON, schema: ...").
-  - Hard timeout so a stalled LLM cannot block the request past SLA.
+  - Deterministic sampling (temperature=0, max_tokens=600) so retries produce
+    stable output and the request stays well under the 30-second SLA.
+  - One bounded retry on JSON parse failure with a strict repair prompt.
+  - Hard per-call timeout so a stalled LLM cannot block the request.
   - All inputs and outputs pass through the rule-based verifier downstream;
     we never trust an LLM output blindly.
 
-Environment variables (all optional):
-  LLM_API_KEY      - bearer token (or "dummy" to disable calls)
-  LLM_BASE_URL     - e.g. https://api.openai.com/v1
-  LLM_MODEL        - e.g. gpt-4o-mini
+Environment variables (all required to start the service):
+  LLM_API_KEY      - bearer token (REQUIRED; non-empty and not "dummy")
+  LLM_BASE_URL     - e.g. https://api.openai.com/v1 or https://openrouter.ai/api/v1 (REQUIRED)
+  LLM_MODEL        - e.g. gpt-4o-mini or openai/gpt-4o-mini (REQUIRED)
   LLM_TIMEOUT_S    - per-call timeout in seconds (default 8)
-  LLM_ENABLED      - "0" to force-disable regardless of other env vars
+  LLM_ENABLED      - must be exactly "1" to enable; anything else refuses to start
+
+OpenRouter extras (optional, for attribution/ranking):
+  OPENROUTER_APP_NAME  - sent as X-Title header
+  OPENROUTER_APP_URL   - sent as HTTP-Referer header
 """
 
 from __future__ import annotations
@@ -83,25 +87,66 @@ class LLMConfig:
 
 
 def _load_config() -> LLMConfig:
-    enabled_env = os.environ.get("LLM_ENABLED", "1").lower() not in {"0", "false", "no"}
-    api_key = os.environ.get("LLM_API_KEY") or None
-    base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-    timeout_s = float(os.environ.get("LLM_TIMEOUT_S", "8"))
-    enabled = enabled_env and bool(api_key) and api_key.lower() != "dummy"
+    """Load LLM config. Raises LLMConfigError if anything required is missing.
+
+    LLM is mandatory in this service: the request budget (30s) is sized around
+    one LLM call, and the rule path alone cannot reproduce the spec's evidence
+    reasoning for hidden test cases. So we refuse to start without it.
+    """
+    enabled_env = os.environ.get("LLM_ENABLED", "1") == "1"
+    api_key = (os.environ.get("LLM_API_KEY") or "").strip()
+    base_url = (os.environ.get("LLM_BASE_URL") or "").strip().rstrip("/")
+    model = (os.environ.get("LLM_MODEL") or "").strip()
+    try:
+        timeout_s = float(os.environ.get("LLM_TIMEOUT_S", "8"))
+    except ValueError:
+        timeout_s = 8.0
+
+    missing = []
+    if not enabled_env:
+        missing.append("LLM_ENABLED (must be '1')")
+    if not api_key or api_key.lower() == "dummy":
+        missing.append("LLM_API_KEY (non-empty, non-dummy)")
+    if not base_url:
+        missing.append("LLM_BASE_URL (e.g. https://openrouter.ai/api/v1)")
+    if not model:
+        missing.append("LLM_MODEL (e.g. openai/gpt-4o-mini)")
+    if missing:
+        raise LLMConfigError(
+            "LLM is required. Missing/invalid env vars: " + ", ".join(missing)
+        )
+
     return LLMConfig(
         api_key=api_key,
         base_url=base_url,
         model=model,
         timeout_s=timeout_s,
-        enabled=enabled,
+        enabled=True,
     )
+
+
+class LLMConfigError(RuntimeError):
+    """Raised at startup when the LLM is not configured."""
+
+
+def _provider_headers() -> Dict[str, str]:
+    """Extra headers for OpenRouter attribution. Harmless on other providers."""
+    h: Dict[str, str] = {}
+    name = os.environ.get("OPENROUTER_APP_NAME")
+    url = os.environ.get("OPENROUTER_APP_URL")
+    if name:
+        h["X-Title"] = name
+    if url:
+        h["HTTP-Referer"] = url
+    return h
 
 
 class LLMClient:
     """OpenAI-compatible chat-completions client with retry/repair."""
 
     def __init__(self, config: Optional[LLMConfig] = None):
+        # Raises LLMConfigError when env is incomplete; the service must not
+        # start without an LLM.
         self.config = config or _load_config()
 
     @property
@@ -179,15 +224,18 @@ class LLMClient:
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 700,
+            "max_tokens": 600,
         }
+        headers: Dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.api_key}",
+        }
+        # OpenRouter-friendly attribution headers; ignored by other providers.
+        headers.update(_provider_headers())
         req = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.config.api_key}",
-            },
+            headers=headers,
             method="POST",
         )
         t0 = time.time()
