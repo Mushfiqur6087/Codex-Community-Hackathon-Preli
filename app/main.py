@@ -1,8 +1,9 @@
 """FastAPI entry point for QueueStorm Investigator.
 
-Step 2: /health returns readiness; /analyze-ticket now accepts a strictly
-validated request (Pydantic) and returns a locked-shape response. Steps 3-6
-will replace the placeholder values with the evidence + safety engines.
+Step 3: /health returns readiness; /analyze-ticket now runs the hybrid
+Evidence Reasoning Engine (deterministic extractors -> rule path OR LLM path
+-> rule-based verifier -> Pydantic). Steps 4-6 will layer in the safety
+finisher and the test harness.
 
 HTTP semantics (Problem Statement section 4.1):
     200 -> success
@@ -13,15 +14,30 @@ HTTP semantics (Problem Statement section 4.1):
 
 from __future__ import annotations
 
+import logging
+import time
+
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.llm_client import LLMClient
+from app.reasoning import decide
 from app.schemas import AnalyzeTicketRequest, AnalyzeTicketResponse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("app.main")
+
+# Shared LLM client (reads env vars once at boot). When unconfigured, the
+# orchestrator falls back to the rule path automatically.
+llm_client = LLMClient()
 
 app = FastAPI(
     title="QueueStorm Investigator",
-    version="0.2.0-step2",
+    version="0.3.0-step3",
     description=(
         "SUST CSE Carnival 2026 Codex Community Hackathon preliminary. "
         "Provides /health and /analyze-ticket. See Problem Statement for "
@@ -36,7 +52,7 @@ app = FastAPI(
 @app.get("/health")
 def health() -> dict:
     """Readiness probe. Judge harness calls this before hidden tests."""
-    return {"status": "ok"}
+    return {"status": "ok", "llm_enabled": llm_client.enabled}
 
 
 # --- Main endpoint ---
@@ -88,9 +104,10 @@ _OPENAPI_REQUEST_EXAMPLE = {
     },
 )
 def analyze_ticket(payload: AnalyzeTicketRequest) -> AnalyzeTicketResponse:
-    """Step-2 stub: validate request, return schema-locked placeholder.
+    """Run the Evidence Reasoning Engine and return the structured verdict.
 
-    Steps 3-6 replace the body with the evidence engine + safety layer.
+    Pipeline: extractors -> (safety short-circuit | rule path | LLM path)
+    -> rule-based verifier -> Pydantic final validation.
     """
     # Extra semantic guards beyond Pydantic (return 422, not 500).
     if not payload.complaint.strip():
@@ -98,24 +115,17 @@ def analyze_ticket(payload: AnalyzeTicketRequest) -> AnalyzeTicketResponse:
             status_code=422, detail="complaint must contain non-whitespace text"
         )
 
-    return AnalyzeTicketResponse(
-        ticket_id=payload.ticket_id,
-        relevant_transaction_id=None,
-        evidence_verdict="insufficient_data",
-        case_type="other",
-        severity="low",
-        department="customer_support",
-        agent_summary="Step 2 placeholder - reasoning engine not yet wired.",
-        recommended_next_action="Implement Step 3 evidence reasoning.",
-        customer_reply=(
-            "Thank you for contacting support. We are reviewing your case "
-            "and will follow up through official support channels. We never "
-            "ask for PIN, OTP, or password."
-        ),
-        human_review_required=True,
-        confidence=0.0,
-        reason_codes=["step2_stub"],
+    t0 = time.perf_counter()
+    result = decide(payload, client=llm_client)
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    logger.info(
+        "ticket=%s path=%s overrides=%d latency=%.1fms",
+        payload.ticket_id,
+        result.path,
+        len(result.verifier_overrides),
+        latency_ms,
     )
+    return result.response
 
 
 # --- Error handlers (controlled bodies, no leaks) ---
